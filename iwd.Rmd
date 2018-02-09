@@ -1,0 +1,371 @@
+---
+title: "A VERY quick and dirty PoC for the IWD Use Case"
+author: "Andrew Lowe"
+date: "9 February 2018"
+output:
+  pdf_document: default
+  html_document:
+    self_contained: no
+---
+
+## Business challenge
+
+* Quantify the impact of various drivers on the share performance of a specific brand across a selected market.
+* Predict the share performance of brands for future periods.
+
+In the following, we will prove that we have achieved both objectives.
+
+## Configure setup and load the data
+
+The easiest way to import the data into R is to first export it from Spotfire as an Excel spreadsheet. (Unfortunately, exporting the data as a tab-delimited text file results in weird encoding issues that cause errors like "embedded nul in string" when using `read.table` or `fread` to read the data in R.):
+```{r}
+suppressPackageStartupMessages( # Tidyverse is verbose on startup
+  require(tidyverse) # We'll need tools from this library
+)
+set.seed(42) # Set random number seed for the sake of reproducibility
+
+require(readxl) # For reading Excel files
+dat.xls <- read_xls("Data Table.xls") # Read in data
+names(dat.xls) # Print column names
+```
+
+## Data cleaning
+
+We subset the data to contain just the columns that we believe we need for buildig a predictive model:
+```{r}
+# Select the columns we need (according to Tamas Sarkadi <Tamas_Sarkadi@epam.com>):
+dat <- dat.xls[, names(dat.xls) %in% c(
+  "Category",
+  "Company",
+  "Brand",
+  "Form",                    
+  "Concentration",
+  "BasicSize",
+  "SecondBenefit",
+  "NumberOfJobs",          
+  "Item",
+  "ValueSalesMLC", # Target
+  "Date", # Timestamp
+  "WeightedDistribution", # Feature
+  "WDFeature", # Feature
+  "WDDisplay", # Feature
+  "WDPriceCut", # Feature
+  "PPSU" # Feature
+)]
+names(dat)
+```
+
+Some columns are single valued and therefore have no predictive value; they are removed:
+```{r}
+strip.single.valued <- function(df) {
+  only.one.value <- sapply(df, function(x) length(unique(x)) == 1) # Count unique values
+  str(df[1, only.one.value]) # These columns only have one unique value! Print them
+  df <- df[, !only.one.value] # Remove those columns
+  return(df)
+}
+
+dat <- strip.single.valued(dat) # Do it
+```
+
+The date information (in *POSIXct* format) is transformed into *Date* format:
+```{r}
+require(lubridate)
+dat$Date <- ymd(dat$Date) # Transform into Date object
+```
+
+We remove any duplicated columns, if present:
+```{r remove-duplicate-features}
+# Remove columns with duplicate entries by fast comparison of hashes:
+require(digest)
+duplicate.columns <- names(dat)[duplicated(lapply(dat, digest))]
+if(length(duplicate.columns) == 0) {# Are there any duplicate columns?
+  print("No duplicated columns")
+} else {
+  print(duplicate.columns)
+}
+
+dat <- dat[, !names(dat) %in% duplicate.columns]
+names(dat)
+```
+
+We transform character strings to categorical variables:
+```{r}
+dat <- dat %>% mutate_if(is.character, as.factor)
+```
+
+Now we do the drill-down to get the products/SKUs. How many do we have?
+```{r}
+dat %>% group_by(Company, 
+                 Brand, 
+                 Form, 
+                 Concentration, 
+                 SecondBenefit, 
+                 NumberOfJobs, 
+                 BasicSize, 
+                 Item) %>% 
+  mutate(SKU = paste( # Add SKU id
+    Company, 
+    Brand, 
+    Form, 
+    Concentration, 
+    SecondBenefit, 
+    NumberOfJobs, 
+    BasicSize, 
+    Item,
+    sep = " | ")
+  ) %>% 
+  arrange(SKU, Date) %>% # Order by SKU then Date
+  mutate(count = n()) -> products
+
+products %>% count() %>% nrow() # How many products?
+length(unique(products$SKU)) # Check maths: wow many SKUs? Should be identical.
+```
+
+Some products have data reported for many time points, while others have little data:
+```{r}
+products %>% pull(count) %>% summary() # Print summary of counts
+```
+
+What's the maximum size of the reporting period?
+```{r}
+range(products$Date)
+```
+
+Measurements appear to be taken weekly:
+```{r}
+head(sort(unique(products$Date)))
+```
+
+We plot a quick glimpse of the data for the SKUs with more than the mean number of measurements.
+```{r, fig.height = 12, fig.asp = 1, fig.cap="Data for a selection of SKUs."}
+products %>% filter(count > 125) %>% 
+  ggplot(aes(x = Date, y = ValueSalesMLC, group = SKU)) +
+  facet_wrap(~SKU, scales = "free_y", ncol = 6) +
+  geom_line() +
+  theme_bw() +
+  theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank()
+  )
+```
+
+\newpage
+## Forecasting
+
+We'll limit forecasts for SKUs for which we have at least 52 measurements:
+```{r}
+products %>% filter(count >= 52) -> products
+```
+
+Make a list of SKUs:
+```{r}
+sort(unique(products$SKU)) -> SKUs
+```
+
+Select an SKU in list:
+```{r}
+products %>% filter(SKU == SKUs[2]) -> product
+```
+
+There is missing data that is invisibly missing; the rows themselves are missing. Therefore we left-join to a column of dates covering the period such that the original data is padded with missing values:
+```{r}
+begin <- range(product$Date)[1]
+end <- range(product$Date)[2]
+dates <- data.frame(Date = seq(from = begin, to = end, by = "week"))
+
+left_join(dates, product, by = "Date") %>% 
+  mutate( # Expand-out data information
+    year = as.numeric(format(Date, format = "%Y")),
+    week = week(Date) # Week number
+  ) -> product
+```
+
+Partition the data into training and test data:
+```{r}
+require(caret)
+split.percent <- 0.85 # 15% holdout
+p <- floor(split.percent * nrow(product))
+q <- nrow(product) - p
+print(c(p+q, p, q)) # Total number of data points and number in each partition
+in.train <- createTimeSlices(1:nrow(product), p, q)
+
+df <- as.data.frame(product)
+train <- df[unlist(in.train$train),]
+test <- df[unlist(in.train$test),]
+```
+
+Start of reporting periods (both partitions):
+```{r}
+start.train <- c(train$year[1], train$week[1])
+start.test <- c(test$year[1], test$week[1])
+```
+
+Auto-fit an ARIMA model for an SKU, and interpolate missing values:
+```{r}
+require(forecast)
+train.ts <- na.interp(
+  ts(train$ValueSalesMLC, frequency = 52, start = start.train)
+)
+train.WeightedDistribution <- na.interp(
+  ts(train$WeightedDistribution, frequency = 52, start = start.train)
+)
+train.PPSU <- na.interp(
+  ts(train$PPSU, frequency = 52, start = start.train)
+)
+train.WDPriceCut <- na.interp(
+  ts(train$WDPriceCut, frequency = 52, start = start.train)
+)
+xregs <- cbind(train.WeightedDistribution, train.PPSU, train.WDPriceCut)
+
+arima.fit <- auto.arima(train.ts, trace = TRUE, xreg = xregs)
+summary(arima.fit)
+```
+
+Forecast ahead for the next 12 weeks:
+```{r}
+test.ts <- ts(test$ValueSalesMLC, frequency = 52, start = start.test)
+
+test.WeightedDistribution <- na.interp(
+  ts(test$WeightedDistribution, frequency = 52, start = start.test)
+)
+test.PPSU <- na.interp(
+  ts(test$PPSU, frequency = 52, start = start.test)
+)
+test.WDPriceCut <- na.interp(
+  ts(test$WDPriceCut, frequency = 52, start = start.test)
+)
+xregs <- cbind(test.WeightedDistribution, test.PPSU, test.WDPriceCut)
+
+arima.forecast <- forecast(arima.fit, h = q, xreg = xregs)
+```
+
+Plot the forecast:
+```{r}
+train.df <- as.data.frame(time(train.ts))
+names(train.df) <- "x"
+train.df$y <- as.vector(train.ts)
+train.df$Partition <- "Train"
+
+test.df <- as.data.frame(time(test.ts))
+names(test.df) <- "x"
+test.df$y <- as.vector(test.ts)
+test.df$Partition <- "Test"
+
+points.dat <- suppressWarnings(bind_rows(test.df, train.df))
+
+autoplot(arima.forecast) +
+  ylab("ValueSalesMLC") +
+  geom_point(data = points.dat, aes(x = x, y = y, colour = Partition)) +
+  scale_color_manual(values = c("Train" = 'Black','Test' = 'Red'))
+
+accuracy(arima.forecast)
+```
+
+We perform a statistical siginificant test of the coefficients of the fitted model; if the *p*-value is less than 5% we take this as evidence that the coefficient is statistically significant. The size of the coefficient provides a measure of the corresponding variable's importance in the model. **This addresses the challenge of determining the performance drivers for a specific product:**
+```{r}
+require(lmtest)
+coeftest(arima.fit)
+print(arima.fit$aic) # Print Akaike information criterion (AIC)
+```
+
+Wrap up everything we've just done for one SKU in a *crystal ball* function that we can run for any SKU:
+```{r}
+crystal.ball <- function(SKU.num, split.percent, verbose = FALSE) {
+  products %>% filter(SKU == SKUs[SKU.num]) -> product
+  
+  begin <- range(product$Date)[1]
+  end <- range(product$Date)[2]
+  dates <- data.frame(Date = seq(from = begin, to = end, by = "week"))
+  
+  left_join(dates, product, by = "Date") %>% 
+    mutate( # Expand-out data information
+      year = as.numeric(format(Date, format = "%Y")),
+      week = week(Date) # Week number
+    ) -> product
+  
+  p <- floor(split.percent * nrow(product))
+  q <- nrow(product) - p
+  
+  in.train <- createTimeSlices(1:nrow(product), p, q)
+  
+  df <- as.data.frame(product)
+  train <- df[unlist(in.train$train),]
+  test <- df[unlist(in.train$test),]
+  
+  start.train <- c(train$year[1], train$week[1])
+  start.test <- c(test$year[1], test$week[1])
+  
+  train.ts <- na.interp(
+    ts(train$ValueSalesMLC, frequency = 52, start = start.train)
+  )
+  train.WeightedDistribution <- na.interp(
+    ts(train$WeightedDistribution, frequency = 52, start = start.train)
+  )
+  train.PPSU <- na.interp(
+    ts(train$PPSU, frequency = 52, start = start.train)
+  )
+  train.WDPriceCut <- na.interp(
+    ts(train$WDPriceCut, frequency = 52, start = start.train)
+  )
+  train.xregs <- cbind(train.WeightedDistribution, train.PPSU, train.WDPriceCut)
+  
+  test.ts <- ts(test$ValueSalesMLC, frequency = 52, start = start.test)
+
+  test.WeightedDistribution <- na.interp(
+    ts(test$WeightedDistribution, frequency = 52, start = start.test)
+  )
+  test.PPSU <- na.interp(
+    ts(test$PPSU, frequency = 52, start = start.test)
+  )
+  test.WDPriceCut <- na.interp(
+    ts(test$WDPriceCut, frequency = 52, start = start.test)
+  )
+  test.xregs <- cbind(test.WeightedDistribution, test.PPSU, test.WDPriceCut)
+  
+  arima.fit <- auto.arima(train.ts, trace = FALSE, xreg = train.xregs)
+  
+  if(verbose) {
+    print(coeftest(arima.fit))
+    print(arima.fit$aic) # Print Akaike information criterion (AIC)
+  }
+  
+  arima.forecast <- forecast(arima.fit, h = q, xreg = test.xregs)
+  
+  train.df <- as.data.frame(time(train.ts))
+  names(train.df) <- "x"
+  train.df$y <- as.vector(train.ts)
+  train.df$Partition <- "Train"
+  
+  test.df <- as.data.frame(time(test.ts))
+  names(test.df) <- "x"
+  test.df$y <- as.vector(test.ts)
+  test.df$Partition <- "Test"
+  
+  points.dat <- suppressWarnings(bind_rows(test.df, train.df))
+  
+  autoplot(arima.forecast) +
+    ylab("ValueSalesMLC") +
+    geom_point(data = points.dat, aes(x = x, y = y, colour = Partition)) +
+    scale_color_manual(values = c("Train" = 'Black','Test' = 'Red'))
+}
+```
+
+```{r}
+crystal.ball(5, 0.85, verbose = TRUE)
+```
+
+Let's test our crystal ball function on some randomly-selected SKUs:
+```{r}
+random.SKUs <- sample(length(SKUs), size = 6, replace = FALSE)
+lapply(random.SKUs, function(N) crystal.ball(N, 0.85))
+```
+
+## What could have been done better
+
+We could introduce lagged versions of the explanatory variables into the model, and we could select the best model using AIC -- we didn't do this here, but it would be reasonably trivial to implement with more time.
