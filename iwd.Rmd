@@ -1,7 +1,7 @@
 ---
-title: "A VERY quick and dirty PoC for the IWD Use Case"
+title: "Rainforest Hack Hour"
 author: "Andrew Lowe"
-date: "9 February 2018"
+date: "21 March 2018"
 output:
   pdf_document: default
   html_document:
@@ -17,6 +17,22 @@ In the following, we will prove that we have achieved both objectives.
 
 ## Configure setup and load the data
 
+```{r quiet, echo = FALSE}
+# Some packages are needlessly noisy and verbose; direct output to /dev/null:
+quiet <- function(some.noisy.function) {
+  capture.output(
+    file = "junk",
+    suppressWarnings(
+      suppressMessages(
+        suppressPackageStartupMessages(
+          some.noisy.function
+        )
+      )
+    )
+  )
+}
+```
+
 The easiest way to import the data into R is to first export it from Spotfire as an Excel spreadsheet. (Unfortunately, exporting the data as a tab-delimited text file results in weird encoding issues that cause errors like "embedded nul in string" when using `read.table` or `fread` to read the data in R.):
 ```{r}
 suppressPackageStartupMessages( # Tidyverse is verbose on startup
@@ -27,6 +43,10 @@ set.seed(42) # Set random number seed for the sake of reproducibility
 require(readxl) # For reading Excel files
 dat.xls <- read_xls("Data Table.xls") # Read in data
 names(dat.xls) # Print column names
+```
+
+```{r}
+View(dat.xls)
 ```
 
 ## Data cleaning
@@ -170,7 +190,7 @@ sort(unique(products$SKU)) -> SKUs
 
 Select an SKU in list:
 ```{r}
-products %>% filter(SKU == SKUs[2]) -> product
+products %>% filter(SKU == SKUs[3]) -> product
 ```
 
 There is missing data that is invisibly missing; the rows themselves are missing. Therefore we left-join to a column of dates covering the period such that the original data is padded with missing values:
@@ -204,6 +224,8 @@ Start of reporting periods (both partitions):
 ```{r}
 start.train <- c(train$year[1], train$week[1])
 start.test <- c(test$year[1], test$week[1])
+print(start.train)
+print(start.test)
 ```
 
 Auto-fit an ARIMA model for an SKU, and interpolate missing values:
@@ -221,9 +243,18 @@ train.PPSU <- na.interp(
 train.WDPriceCut <- na.interp(
   ts(train$WDPriceCut, frequency = 52, start = start.train)
 )
-xregs <- cbind(train.WeightedDistribution, train.PPSU, train.WDPriceCut)
+```
 
-arima.fit <- auto.arima(train.ts, trace = TRUE, xreg = xregs)
+```{r}
+train.xregs <- cbind(train.WeightedDistribution, train.PPSU, train.WDPriceCut)
+# names.xregs <- colnames(xregs)
+# xregs <- embed(xregs, 3)
+# 
+# colnames(xregs) <- make.names(rep(names.xregs, 3), unique = TRUE)
+```
+
+```{r}
+arima.fit <- auto.arima(train.ts, trace = TRUE, xreg = train.xregs)
 summary(arima.fit)
 ```
 
@@ -240,9 +271,19 @@ test.PPSU <- na.interp(
 test.WDPriceCut <- na.interp(
   ts(test$WDPriceCut, frequency = 52, start = start.test)
 )
-xregs <- cbind(test.WeightedDistribution, test.PPSU, test.WDPriceCut)
+test.xregs <- cbind(test.WeightedDistribution, test.PPSU, test.WDPriceCut)
+```
 
-arima.forecast <- forecast(arima.fit, h = q, xreg = xregs)
+```{r}
+# xregs <- cbind(test.WeightedDistribution, test.PPSU, test.WDPriceCut)
+# names.xregs <- colnames(xregs)
+# xregs <- embed(xregs, 3)
+# 
+# colnames(xregs) <- make.names(rep(names.xregs, 3), unique = TRUE)
+```
+
+```{r}
+arima.forecast <- forecast(arima.fit, h = q, xreg = test.xregs)
 ```
 
 Plot the forecast:
@@ -272,6 +313,40 @@ We perform a statistical siginificant test of the coefficients of the fitted mod
 require(lmtest)
 coeftest(arima.fit)
 print(arima.fit$aic) # Print Akaike information criterion (AIC)
+```
+
+```{r}
+require(earlywarnings)
+out <- quiet(bdstest_ews(as.data.frame(train.ts), ARMAoptim = FALSE))
+```
+
+```{r}
+out <- quiet(ch_ews(as.data.frame(train.ts)))
+```
+
+```{r}
+out <- quiet(ddjnonparam_ews(as.data.frame(train.ts)))
+```
+
+```{r}
+out <- quiet(generic_ews(as.data.frame(train.ts)))
+```
+
+```{r}
+res <- livpotential_ews(as.data.frame(train.ts))
+```
+
+```{r}
+out <- quiet(qda_ews(as.data.frame(train.ts)))
+#plot(out$potential.plot$plot)
+```
+
+```{r}
+out <- quiet(sensitivity_ews(as.data.frame(train.ts)))
+```
+
+```{r}
+out <- quiet(surrogates_ews(as.data.frame(train.ts)))
 ```
 
 Wrap up everything we've just done for one SKU in a *crystal ball* function that we can run for any SKU:
@@ -330,6 +405,9 @@ crystal.ball <- function(SKU.num, split.percent, verbose = FALSE) {
   
   arima.fit <- auto.arima(train.ts, trace = FALSE, xreg = train.xregs)
   
+#   res = AnomalyDetectionVec(as.vector(train.ts), max_anoms=0.02, period = 52, direction='both', plot=TRUE)
+# plot(res$plot)
+  
   if(verbose) {
     print(coeftest(arima.fit))
     print(arima.fit$aic) # Print Akaike information criterion (AIC)
@@ -349,10 +427,13 @@ crystal.ball <- function(SKU.num, split.percent, verbose = FALSE) {
   
   points.dat <- suppressWarnings(bind_rows(test.df, train.df))
   
-  autoplot(arima.forecast) +
+  out <- quiet(generic_ews(as.data.frame(train.ts)))
+  
+  plt <- autoplot(arima.forecast) +
     ylab("ValueSalesMLC") +
     geom_point(data = points.dat, aes(x = x, y = y, colour = Partition)) +
     scale_color_manual(values = c("Train" = 'Black','Test' = 'Red'))
+  plt
 }
 ```
 
@@ -369,3 +450,7 @@ lapply(random.SKUs, function(N) crystal.ball(N, 0.85))
 ## What could have been done better
 
 We could introduce lagged versions of the explanatory variables into the model, and we could select the best model using AIC -- we didn't do this here, but it would be reasonably trivial to implement with more time.
+
+```{r}
+sessionInfo()
+```
